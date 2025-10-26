@@ -8,9 +8,9 @@
 """
 
 import re
-import os
-import PyPDF2
+import pdfplumber
 import pandas as pd
+from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
@@ -44,15 +44,14 @@ def process_pdf_files(directory, filename):
     """Извлекает текст из одного PDF-файла."""
     file_path = Path(directory) / filename
     try:
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
+        with pdfplumber.open(file_path) as pdf:
             text = ''
-            for page in reader.pages:
+            for page in pdf.pages:
                 page_text = page.extract_text()
                 if page_text:
                     text += page_text + "\n"
-            logger.info(f"📄 Успешно извлечён текст из '{filename}' ({len(reader.pages)} стр.)")
-            logger.info(f"{text[100:500]}")
+            logger.info(f"📄 Успешно извлечён текст из '{filename}' ({len(text)} стр.)")
+            logger.info(f"{text[100:300]}")
             return text
     except Exception as e:
         logger.error(f"❌ Ошибка при чтении PDF '{filename}': {e}")
@@ -73,63 +72,99 @@ def extract_amount(text):
     return None
 
 
-def extract_supplier(text):
+def extract_supplier(text: str) -> str:
     """Извлекает поставщика (ООО или ИП)."""
-    match_ooo = re.search(r'Поставщик:.*?"([А-ЯЁ][А-ЯЁ\s\d\-]+)', text, re.IGNORECASE | re.DOTALL)
-    if match_ooo:
-        supplier = match_ooo.group(1).strip().title()
-        logger.info(f"🏭 Поставщик (ООО): {supplier}")
-        return supplier
-
-    match_ip = re.search(r'(?:Индивидуальный предприниматель|ИП)\s+([А-ЯЁ][А-ЯЁа-яё\s\-]+)', text, re.IGNORECASE | re.DOTALL)
-    if match_ip:
-        full_name = match_ip.group(1).strip()
-        surname = full_name.split()[0].title()
-        logger.info(f"👤 Поставщик (ИП): {surname}")
-        return surname
-
+    lower_text = text.lower()
+    match_start = re.search(r'получател', lower_text)
+    if not match_start:
+        logger.debug("Поставщик не найден.")
+        return None 
+    
+    # Начинаем поиск в тексте
+    search_area = text[match_start.start():]
+    logger.debug(f"🔍 Search area: {repr(search_area[:100])}")
+    patterns = [
+        # 3. ИП полное имя (берём только первое слово после ИП)
+        r'ИП\s+([А-ЯЁ][А-ЯЁа-яё\-]+)',
+        # 4. ИП с инициалами
+        r'ИП\s+([А-ЯЁ][а-яё]+?)\s+[А-ЯЁ]\.\s*[А-ЯЁ]\.',
+        # 5. Полная форма ИП
+        r'Индивидуальный\s+предприниматель\s+([А-ЯЁ][а-яё]+)',
+        # 1. ООО в кавычках (любые кавычки: «», "", '')
+        r'ООО\s*[«"]([^»"]+?)[»"]',
+        # 2. ООО без кавычек — захватываем всё до первого "стоп-слова" или конца строки
+        r'ООО\s+([А-ЯЁ][А-ЯЁа-яё\s\-]+?)(?=\s+(?:ИНН|КПП|Сч\.?|Вид|Наз\.|Очер|Код|Рез|Оплата|Банк|$))'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, search_area)
+        if match:
+            name = match.group(1).strip()
+            # Убираем возможные кавычки
+            name = re.sub(r'^["«"]+|["»"]+$', '', name)
+            supplier = name.strip()
+            logger.info(f"🏭 Поставщик: {supplier}")
+            return supplier
+    
     logger.debug("Поставщик не найден.")
+    return None  # если ничего не найдено
+
+
+def get_date_from_line(text: str):
+    # Словарь для перевода названий месяцев в числа
+    month_names = {
+        'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4,
+        'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8,
+        'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12
+    }
+
+    # 1. Поиск даты в формате дд.мм.гггг
+    dot_date_match = re.search(r'(\d{1,2})\.(\d{1,2})\.(\d{4})', text)
+    if dot_date_match:
+        day, month, year = map(int, dot_date_match.groups())
+        try:
+            date_part = datetime(year, month, day).date()
+            logger.info(f"📆 Извлечена дата: {date_part}")
+            return date_part
+        except ValueError:
+            pass  # Некорректная дата
+
+    # 2. Поиск даты в формате "д (или дд) месяц гггг"
+    word_date_pattern = r'(\d{1,2})\s*([а-яё]+)\s+(\d{4})\s*(?:г\.?)?'
+    matches = re.finditer(word_date_pattern, text, re.IGNORECASE)
+    for match in matches:
+        day_str, month_word, year_str = match.groups()
+        day = int(day_str)
+        year = int(year_str)
+        month_word = month_word.lower()
+
+        if month_word in month_names:
+            month = month_names[month_word]
+            try:
+                date_part = datetime(year, month, day).date()
+                logger.info(f"📆 Извлечена дата: {date_part}")
+                return date_part
+            except ValueError:
+                continue  # Некорректная дата
+
+    # Если ничего не найдено
     return None
 
 
-def extract_date_from_line(line):
-    """Извлекает дату после слова 'от'."""
-    if "от" not in line.lower():
-        return None
-    index = line.lower().find("от") + 2
-    date_part = line[index:].strip()
-
-    if "г." in date_part:
-        date_part = date_part.split("г.")[0].strip()
-    elif "года" in date_part:
-        date_part = date_part.split("года")[0].strip()
-
-    month_list = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня',
-                  'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря']
-    for i, month in enumerate(month_list, 1):
-        if month in date_part:
-            date_part = date_part.replace(month, str(i)).replace(' ', '.')
-            break
-    return date_part
-
-
 def get_num_invoce(text, target_phrase):
-    """Извлекает номер и дату счета по ключевой фразе."""
+    """Извлекает номер по ключевой фразе."""
     invoice_number = None
-    invoice_date = None
     for line in text.splitlines():
         if target_phrase in line.lower():
             parts = line.split("оплату №")
             if len(parts) > 1:
                 invoice_number = parts[1].strip().split()[0]
-                invoice_date = extract_date_from_line(line)
                 break
-    logger.info(f"💰 Извлечена дата: {invoice_date}")
     logger.info(f"💰 Извлечен номер: {invoice_number}")
-    return invoice_number, invoice_date
+    return invoice_number
 
 
-def extract_invoice_data(pdf_files, directory, df_register, target_phrase="счет"):
+def extract_invoice_data(pdf_files, directory, target_phrase="счет"):
     """Извлекает данные из всех PDF-файлов."""
     invoice_data_list = []
     for f in pdf_files:
@@ -139,38 +174,63 @@ def extract_invoice_data(pdf_files, directory, df_register, target_phrase="сч�
                 logger.warning(f"⚠️ Не удалось извлечь текст из '{f}'. Пропущен.")
                 continue
 
-            invoice_number, invoice_date = get_num_invoce(text, target_phrase)
+            invoice_number = get_num_invoce(text, target_phrase)
+            invoice_date = get_date_from_line(text)
             supplier = extract_supplier(text)
             amount = extract_amount(text)
-
-            if invoice_number and invoice_number not in df_register['№ счета'].values:
-                invoice_data_list.append({
+            invoice_data_list.append({
                     '№ счета': invoice_number,
                     'Дата счета': invoice_date,
                     'Поставщик': supplier,
                     'Сумма': amount
                 })
-                logger.info(f"✅ Счёт №{invoice_number} добавлен из '{f}'")
-            else:
-                logger.info(f"ℹ️ Счёт №{invoice_number} уже есть в реестре или не найден.")
+
+            logger.info(f"✅ Счёт №{invoice_number} добавлен из '{f}'")
+
         except Exception as e:
             logger.error(f"❌ Ошибка при обработке '{f}': {e}")
 
-    return pd.DataFrame(invoice_data_list, columns=['№ счета', 'Дата счета', 'Поставщик', 'Сумма'])
+    
+    invoice_df = pd.DataFrame(invoice_data_list, columns=['№ счета', 'Дата счета', 'Поставщик', 'Сумма'])
+    invoice_df['Дата счета'] = pd.to_datetime(invoice_df['Дата счета'], errors='coerce')
+    invoice_df['Контроль оплаты'] = invoice_df['Дата счета'] + pd.Timedelta(days=21)
+    invoice_df['№ счета'] = invoice_df['№ счета'].pipe(
+        lambda series: series.fillna('')
+        .astype("string")
+        .str.lower()
+        .str.lstrip('0')
+    )
+
+    invoice_df['Сумма'] = pd.to_numeric(invoice_df['Сумма'], errors='coerce').round(2)
+
+    return invoice_df
 
 
 def update_register_with_new_invoices(df_register, df_invoice_reg):
     """
     Обновляет реестр счетов, добавляя новые счета из df_invoice_reg.
-    Генерирует уникальные номера для новых записей (вида 'Ю-1', 'Ю-2' и т.д.).
+    Генерирует уникальные номера для новых записей.
     """
     if df_invoice_reg.empty:
         logger.info("ℹ️ Нет новых счетов для добавления в реестр.")
         return "ℹ️ Нет новых счетов для добавления в реестр."
     try:
         # 1. Объединяем основной датафрейм с новыми строками
-        df_register = pd.concat([df_register, df_invoice_reg], ignore_index=True)
-        logger.info(f"✅ Добавлено {len(df_invoice_reg)} новых записей в реестр.")
+        df_export_unique = df_invoice_reg.drop_duplicates(subset=['№ счета', 'Сумма'])
+        df_register_keep = df_register[['№ счета', 'Сумма']]
+        
+        df_merged = df_export_unique.merge(
+            df_register_keep,
+            on=['№ счета', 'Сумма'],
+            how='left',
+#            suffixes=('', '_merge'),
+            indicator=True
+            )
+        new_rows = df_merged[df_merged['_merge'] == 'left_only'].drop('_merge', axis=1)
+        logger.info(f"✅ Добавлено {new_rows} новых записей в реестр.")
+        df_register = pd.concat([df_register, new_rows], ignore_index=True)
+
+        logger.info(f"✅ Добавлено {len(new_rows)} новых записей в реестр.")
         # 2. Приводим даты к формату datetime
 #        df_register['Дата счета'] = pd.to_datetime(df_register['Дата счета'], errors='coerce')
         # 3. Извлекаем числа из существующих номеров "Ю-..."
@@ -212,7 +272,7 @@ def run_pipeline(directory_path: str) -> str:
         logger.info(f"Обновление реестра: {output_file_path}")
 
         # Шаг 3: Извлечение данных из PDF
-        df_invoice_reg = extract_invoice_data(pdf_files, directory_path, df_register_clean, "счет")
+        df_invoice_reg = extract_invoice_data(pdf_files, directory_path, "счет")
         if df_invoice_reg.empty:
             return "ℹ️ Новых счетов для добавления не найдено."
 
@@ -235,6 +295,6 @@ def run_pipeline(directory_path: str) -> str:
 
 # --- Для теста (не обязательно) ---
 if __name__ == "__main__":
-    test_path = r"C:\Users\Юрий Кистенев\Desktop\ACH_manager"
+    test_path = r"C:\Users\Юрий Кистенев\Desktop\ACH_manager\record"
     result = run_pipeline(test_path)
     print(result)
